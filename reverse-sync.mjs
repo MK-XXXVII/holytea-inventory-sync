@@ -19,7 +19,7 @@ const CONFIG = {
 
   shopDomain: process.env.SHOPIFY_STORE_DOMAIN, // holy-tea-amsterdam.myshopify.com
   locationId: process.env.SHOPIFY_LOCATION_ID,  // gid://shopify/Location/...
-  token: process.env.SHOPIFY_ADMIN_TOKEN,        // injected from Secret Manager
+  token: process.env.SHOPIFY_ADMIN_TOKEN,       // injected from Secret Manager
 };
 
 function requireEnv(name) {
@@ -48,41 +48,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-async function shopifyInventorySetAvailable({ inventoryItemId, locationId, quantity, compareQuantity }) {
+/**
+ * Shopify GraphQL helper
+ */
+async function shopifyGraphql(query, variables) {
   const shopDomain = requireEnv("SHOPIFY_STORE_DOMAIN");
   const token = requireEnv("SHOPIFY_ADMIN_TOKEN");
-  requireEnv("SHOPIFY_LOCATION_ID");
-
   const url = `https://${shopDomain}/admin/api/2025-10/graphql.json`;
-
-  const query = `
-    mutation InventorySet($input: InventorySetQuantitiesInput!) {
-      inventorySetQuantities(input: $input) {
-        inventoryAdjustmentGroup {
-          createdAt
-          reason
-          changes { name delta quantityAfterChange }
-        }
-        userErrors { code field message }
-      }
-    }
-  `;
-
-  const variables = {
-    input: {
-      name: "available",
-      reason: "correction",
-      referenceDocumentUri: "holytea://reverse-sync/google-sheets",
-      quantities: [
-        {
-          inventoryItemId,
-          locationId,
-          quantity,
-          compareQuantity,
-        },
-      ],
-    },
-  };
 
   const resp = await fetch(url, {
     method: "POST",
@@ -93,21 +65,103 @@ async function shopifyInventorySetAvailable({ inventoryItemId, locationId, quant
     body: JSON.stringify({ query, variables }),
   });
 
-  const json = await resp.json();
+  const json = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
     throw new Error(`Shopify HTTP ${resp.status}: ${JSON.stringify(json).slice(0, 500)}`);
   }
 
-  const topErrors = json.errors;
-  if (topErrors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(topErrors).slice(0, 500)}`);
+  if (json.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors).slice(0, 500)}`);
   }
 
-  const payload = json.data?.inventorySetQuantities;
-  const userErrors = payload?.userErrors || [];
+  return json.data;
+}
+
+const GET_CURRENT_AVAILABLE_QUERY = `
+  query GetInventoryLevel($inventoryItemId: ID!, $locationId: ID!) {
+    inventoryLevel(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+      id
+      quantities(names: ["available"]) {
+        name
+        quantity
+      }
+    }
+  }
+`;
+
+async function getCurrentAvailableQuantity(inventoryItemId, locationId) {
+  const data = await shopifyGraphql(GET_CURRENT_AVAILABLE_QUERY, { inventoryItemId, locationId });
+  const q = data?.inventoryLevel?.quantities?.find((x) => x.name === "available")?.quantity;
+  if (typeof q !== "number") {
+    throw new Error("Could not read current Shopify available quantity (inventoryLevel/quantities).");
+  }
+  return q;
+}
+
+const INVENTORY_SET_MUTATION = `
+  mutation InventorySet($input: InventorySetQuantitiesInput!) {
+    inventorySetQuantities(input: $input) {
+      inventoryAdjustmentGroup {
+        createdAt
+        reason
+        changes { name delta quantityAfterChange }
+      }
+      userErrors { code field message }
+    }
+  }
+`;
+
+/**
+ * Sets Shopify "available" quantity using compareQuantity (CAS).
+ * If compareQuantity is stale, retries once using current Shopify quantity.
+ */
+async function shopifyInventorySetAvailable({ inventoryItemId, locationId, quantity, compareQuantity }) {
+  requireEnv("SHOPIFY_STORE_DOMAIN");
+  requireEnv("SHOPIFY_ADMIN_TOKEN");
+  requireEnv("SHOPIFY_LOCATION_ID");
+
+  const runOnce = async (cmpQty) => {
+    const variables = {
+      input: {
+        name: "available",
+        reason: "correction",
+        referenceDocumentUri: "holytea://reverse-sync/google-sheets",
+        quantities: [
+          {
+            inventoryItemId,
+            locationId,
+            quantity,
+            compareQuantity: cmpQty,
+          },
+        ],
+      },
+    };
+
+    const data = await shopifyGraphql(INVENTORY_SET_MUTATION, variables);
+    const payload = data?.inventorySetQuantities;
+    const userErrors = payload?.userErrors || [];
+    return { payload, userErrors };
+  };
+
+  // Attempt #1 using sheet-known compareQuantity
+  let { payload, userErrors } = await runOnce(compareQuantity);
+
   if (userErrors.length) {
-    // Common case: compareQuantity mismatch
+    const stale = userErrors.find((e) => e.code === "COMPARE_QUANTITY_STALE");
+    if (stale) {
+      // Attempt #2: refresh compareQuantity from Shopify and retry once
+      const current = await getCurrentAvailableQuantity(inventoryItemId, locationId);
+      console.log(
+        `COMPARE_QUANTITY_STALE for ${inventoryItemId}. Retrying with current compareQuantity=${current} (desired=${quantity}).`
+      );
+
+      ({ payload, userErrors } = await runOnce(current));
+    }
+  }
+
+  if (userErrors.length) {
+    // Keep userErrors visible in logs/sheet
     throw new Error(`Shopify userErrors: ${JSON.stringify(userErrors).slice(0, 500)}`);
   }
 
@@ -141,8 +195,8 @@ async function main() {
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
 
-    const desired = normalizeInt(row[4]);      // E
-    const available = normalizeInt(row[5]);    // F
+    const desired = normalizeInt(row[4]); // E
+    const available = normalizeInt(row[5]); // F
     const invItemGid = row[9] ? String(row[9]).trim() : null; // J
 
     if (!invItemGid) continue;
@@ -191,7 +245,7 @@ async function main() {
         { range: `${CONFIG.sheetName}!${CONFIG.col.status}${c.rowIndex1Based}`, values: [[""]] },
         { range: `${CONFIG.sheetName}!${CONFIG.col.lastPushedAt}${c.rowIndex1Based}`, values: [[nowIso()]] },
         { range: `${CONFIG.sheetName}!${CONFIG.col.lastError}${c.rowIndex1Based}`, values: [[""]] },
-        { range: `${CONFIG.sheetName}!${CONFIG.col.desired}${c.rowIndex1Based}`, values: [[""]] }, // clear Desired_Available
+        { range: `${CONFIG.sheetName}!${CONFIG.col.desired}${c.rowIndex1Based}`, values: [[""]] } // clear Desired_Available
       );
 
       console.log(`SYNCED row ${c.rowIndex1Based}: ${c.inventoryItemId} ${c.available} -> ${c.desired}`);
@@ -200,7 +254,7 @@ async function main() {
 
       updates.push(
         { range: `${CONFIG.sheetName}!${CONFIG.col.status}${c.rowIndex1Based}`, values: [["ERROR"]] },
-        { range: `${CONFIG.sheetName}!${CONFIG.col.lastError}${c.rowIndex1Based}`, values: [[msg]] },
+        { range: `${CONFIG.sheetName}!${CONFIG.col.lastError}${c.rowIndex1Based}`, values: [[msg]] }
       );
 
       console.error(`ERROR row ${c.rowIndex1Based}: ${msg}`);
