@@ -8,6 +8,10 @@ const CONFIG = {
   sheetName: process.env.SHEET_NAME || "Truth_Table",
 
   headers: {
+    category: "Category",
+    productTitle: "Product_Title",
+    variantTitle: "Variant_Title",
+    sku: "SKU",
     desired: "Desired_Available",
     available: "Available",
     status: "ReverseSync_Status",
@@ -74,6 +78,24 @@ const GET_LOCATION_LEVELS = `
   }
 `;
 
+const GET_INVENTORY_ITEM_DETAILS = `
+  query InventoryItemDetails($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on InventoryItem {
+        id
+        variant {
+          sku
+          title
+          product {
+            title
+            productType
+          }
+        }
+      }
+    }
+  }
+`;
+
 async function buildLocationAvailableMap(locationId, maxPages = 10) {
   const map = new Map(); // inventoryItemId -> availableQuantity
   let after = null;
@@ -95,6 +117,31 @@ async function buildLocationAvailableMap(locationId, maxPages = 10) {
   }
 
   return map;
+}
+
+async function fetchInventoryItemDetails(ids) {
+  const details = new Map(); // inventoryItemId -> { productType, productTitle, variantTitle, sku }
+  const batchSize = 50;
+
+  for (let i = 0; i < ids.length; i += batchSize) {
+    const batch = ids.slice(i, i + batchSize);
+    const data = await shopifyGraphql(GET_INVENTORY_ITEM_DETAILS, { ids: batch });
+    const nodes = data?.nodes || [];
+
+    for (const node of nodes) {
+      if (!node?.id) continue;
+      const variant = node.variant || {};
+      const product = variant.product || {};
+      details.set(node.id, {
+        productType: product.productType || "",
+        productTitle: product.title || "",
+        variantTitle: variant.title || "",
+        sku: variant.sku || "",
+      });
+    }
+  }
+
+  return details;
 }
 
 function buildRowFromHeaders(headers, valuesByHeader) {
@@ -141,27 +188,41 @@ async function main() {
   const availableMap = await buildLocationAvailableMap(CONFIG.locationId);
   console.log(`Shopify map ready. Items: ${availableMap.size}`);
 
+  const missingIds = [];
   const newRows = [];
   for (const [inventoryItemId, available] of availableMap.entries()) {
     if (existingIds.has(inventoryItemId)) continue;
 
+    missingIds.push(inventoryItemId);
+    if (missingIds.length >= CONFIG.maxRowsPerRun) break;
+  }
+
+  if (missingIds.length === 0) {
+    console.log("No new inventory items to append.");
+    return;
+  }
+
+  const detailsMap = await fetchInventoryItemDetails(missingIds);
+
+  for (const inventoryItemId of missingIds) {
+    const available = availableMap.get(inventoryItemId);
+    const details = detailsMap.get(inventoryItemId) || {};
     newRows.push(
       buildRowFromHeaders(headers, {
         [CONFIG.headers.inventoryItemId]: inventoryItemId,
-        [CONFIG.headers.available]: available,
+        [CONFIG.headers.available]: available ?? "",
         [CONFIG.headers.desired]: "",
         [CONFIG.headers.status]: "",
         [CONFIG.headers.lastPushedAt]: "",
         [CONFIG.headers.lastError]: "",
+        [CONFIG.headers.category]: details.productType || "",
+        [CONFIG.headers.productTitle]: details.productTitle || "",
+        [CONFIG.headers.variantTitle]: details.variantTitle || "",
+        [CONFIG.headers.sku]: details.sku || "",
       })
     );
 
     if (newRows.length >= CONFIG.maxRowsPerRun) break;
-  }
-
-  if (newRows.length === 0) {
-    console.log("No new inventory items to append.");
-    return;
   }
 
   console.log(`Appending ${newRows.length} new rows to ${CONFIG.sheetName}...`);
