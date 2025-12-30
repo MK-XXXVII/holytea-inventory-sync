@@ -1,0 +1,24 @@
+# deps
+node_modules/
+
+# secrets / keys
+*.json
+!package*.json
+pubsub-worker-key.json
+*.key
+*.pem
+
+# env
+.env
+.env.*
+
+# logs
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# build
+dist/
