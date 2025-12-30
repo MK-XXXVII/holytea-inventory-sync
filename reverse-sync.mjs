@@ -79,24 +79,47 @@ async function shopifyGraphql(query, variables) {
 }
 
 const GET_CURRENT_AVAILABLE_QUERY = `
-  query GetInventoryLevel($inventoryItemId: ID!, $locationId: ID!) {
-    inventoryLevel(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+  query GetLocationLevelsForRetry($locationId: ID!, $after: String) {
+    location(id: $locationId) {
       id
-      quantities(names: ["available"]) {
-        name
-        quantity
+      inventoryLevels(first: 250, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            item { id }
+            quantities(names: ["available"]) { name quantity }
+          }
+        }
       }
     }
   }
 `;
 
 async function getCurrentAvailableQuantity(inventoryItemId, locationId) {
-  const data = await shopifyGraphql(GET_CURRENT_AVAILABLE_QUERY, { inventoryItemId, locationId });
-  const q = data?.inventoryLevel?.quantities?.find((x) => x.name === "available")?.quantity;
-  if (typeof q !== "number") {
-    throw new Error("Could not read current Shopify available quantity (inventoryLevel/quantities).");
+  // We page through location.inventoryLevels and find the matching item.id
+  let after = null;
+
+  for (let page = 0; page < 10; page++) {
+    const data = await shopifyGraphql(GET_CURRENT_AVAILABLE_QUERY, { locationId, after });
+    const conn = data?.location?.inventoryLevels;
+    const edges = conn?.edges || [];
+
+    for (const e of edges) {
+      const node = e?.node;
+      const itemId = node?.item?.id;
+      if (itemId !== inventoryItemId) continue;
+
+      const qty = node?.quantities?.find((x) => x.name === "available")?.quantity;
+      if (typeof qty === "number") return qty;
+
+      throw new Error("Found matching inventory level but missing 'available' quantity.");
+    }
+
+    if (!conn?.pageInfo?.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
   }
-  return q;
+
+  throw new Error(`Could not find inventory level for item at location (inventoryItemId=${inventoryItemId}).`);
 }
 
 const INVENTORY_SET_MUTATION = `
@@ -218,17 +241,29 @@ async function main() {
 
   if (candidates.length === 0) return;
 
-  // Mark PENDING first
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: CONFIG.spreadsheetId,
-    requestBody: {
-      valueInputOption: "RAW",
-      data: candidates.map((c) => ({
-        range: `${CONFIG.sheetName}!${CONFIG.col.status}${c.rowIndex1Based}`,
-        values: [["PENDING"]],
-      })),
-    },
-  });
+// Refresh status for new desired values (so it doesn't stay "SYNCED" forever)
+await sheets.spreadsheets.values.batchUpdate({
+  spreadsheetId: CONFIG.spreadsheetId,
+  requestBody: {
+    valueInputOption: "RAW",
+    data: candidates.map((c) => ({
+      range: `${CONFIG.sheetName}!${CONFIG.col.status}${c.rowIndex1Based}`,
+      values: [["QUEUED"]],
+    })),
+  },
+});
+
+// Mark PENDING right before pushing to Shopify
+await sheets.spreadsheets.values.batchUpdate({
+  spreadsheetId: CONFIG.spreadsheetId,
+  requestBody: {
+    valueInputOption: "RAW",
+    data: candidates.map((c) => ({
+      range: `${CONFIG.sheetName}!${CONFIG.col.status}${c.rowIndex1Based}`,
+      values: [["PENDING"]],
+    })),
+  },
+});
 
   // Process one-by-one (safe + clear logs)
   const updates = [];
