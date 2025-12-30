@@ -1,96 +1,148 @@
-# Holy Tea — Shopify ↔ Google Sheets Inventory Sync (GCP)
+# Holy Tea – Shopify ↔ Google Sheets Inventory Sync
 
-This repo contains a production-grade inventory sync system for the live Shopify store **Holy Tea**:
-- **Forward sync (Shopify → Pub/Sub → Google Sheets)** via Shopify `inventory_levels/update` webhook.
-- **Reverse sync (Google Sheets → Shopify)** via a scheduled Cloud Run Job that detects changes in a sheet and updates Shopify inventory.
+This repository contains the production-grade infrastructure and workers used by **Holy Tea Amsterdam** to synchronize inventory data between **Shopify** and **Google Sheets**, in both directions.
 
-## High-level architecture
+The system is designed to be:
+- Safe (no infinite loops)
+- Auditable (Google Sheets as source of truth & log)
+- Extensible (Cloud Run Jobs, modular Node.js workers)
+- Production-ready (Secrets Manager, IAM, Scheduler, retries)
 
-### Forward sync (already automated)
-1. Shopify webhook topic: `inventory_levels/update`
-2. Delivery: Pub/Sub URI  
-   `pubsub://shopify-inventory-sync-482323:shopify-inventory-updates`
-3. Pub/Sub subscription (worker): `shopify-inventory-updates-worker`
-4. Cloud Run Job: `inventory-sync-job` (Node.js worker)
-5. Updates Google Sheet tab `Truth_Table` column **Available** based on `InventoryItem_ID` matching.
+---
 
-### Reverse sync (automated)
-1. Users edit `Truth_Table.Desired_Available`
-2. Cloud Scheduler triggers Cloud Run Job: `inventory-reverse-sync-job` (Node.js worker)
-3. Worker scans rows where `Desired_Available != Available`
-4. Calls Shopify Admin GraphQL to set inventory at a specific location
-5. On success:
-   - clears `Desired_Available`
-   - writes `ReverseSync_LastPushedAt`
-   - clears `ReverseSync_LastError`
-   - (optionally) clears `ReverseSync_Status`
+## High-Level Architecture
 
-## Google Cloud resources
+### Shopify → Google Sheets (Forward Sync)
+```
+Shopify Inventory Change
+        ↓
+Shopify Webhook (inventory_levels/update)
+        ↓
+Google Pub/Sub Topic
+        ↓
+Cloud Run Job (inventory-sync-job)
+        ↓
+Google Sheets (Truth_Table → Available)
+```
 
-### Project
-- `shopify-inventory-sync-482323`
+### Google Sheets → Shopify (Reverse Sync)
+```
+Google Sheets (Desired_Available edited)
+        ↓
+Cloud Scheduler (every X minutes)
+        ↓
+Cloud Run Job (inventory-reverse-sync-job)
+        ↓
+Shopify Admin GraphQL API
+        ↓
+Shopify Inventory Updated
+        ↓
+Shopify Webhook fires again
+        ↓
+Forward sync updates Sheet → Available
+```
 
-### Pub/Sub
-- Topic: `shopify-inventory-updates`
-- Subs:
-  - `shopify-inventory-updates-debug` (manual inspect)
-  - `shopify-inventory-updates-worker` (processed by forward job)
+### One-time / Recovery Tool
+```
+Cloud Run Job (inventory-reconcile-available-job)
+→ Rebuilds Sheet.Available from Shopify
+→ Fixes stale / mismatched quantities
+```
 
-### Cloud Run Jobs
-- Forward: `inventory-sync-job` (region `europe-west4`)
-- Reverse: `inventory-reverse-sync-job` (region `europe-west4`)
+---
 
-### Cloud Scheduler
-- Forward scheduler exists (region `europe-west1`)
-- Reverse scheduler:
-  - name: `inventory-reverse-sync-scheduler`
-  - schedule: `*/2 * * * *`
-  - URL (Cloud Run v2):  
-    `https://europe-west4-run.googleapis.com/v2/projects/shopify-inventory-sync-482323/locations/europe-west4/jobs/inventory-reverse-sync-job:run`
-  - Auth: OAuth token
+## Google Sheets Schema (Truth_Table)
 
-### Service Accounts
-- `pubsub-worker@shopify-inventory-sync-482323.iam.gserviceaccount.com`  
-  Used by Cloud Run Jobs. Needs Sheets access + Secret access.
-- `scheduler-runner@shopify-inventory-sync-482323.iam.gserviceaccount.com`  
-  Used by Cloud Scheduler HTTP trigger. Needs Run Invoker.
-- Cloud Scheduler service agent:  
-  `service-615727392740@gcp-sa-cloudscheduler.iam.gserviceaccount.com`  
-  Needs Service Account Token Creator on `scheduler-runner`.
+| Column | Name | Purpose |
+|------:|------|---------|
+| E | Desired_Available | User input – desired stock to push to Shopify |
+| F | Available | Last known Shopify quantity |
+| G | ReverseSync_Status | PENDING, ERROR, or empty |
+| H | ReverseSync_LastPushedAt | ISO timestamp of last successful push |
+| I | ReverseSync_LastError | Error message if sync failed |
+| J | InventoryItem_ID | Shopify GID (gid://shopify/InventoryItem/...) |
 
-## Google Sheets
-- Spreadsheet ID: `15uWLUiduY0qQb6wbHIcUo-pqvp_ghTaO5ZnTP0gNZqg`
-- Tab: `Truth_Table`
-- Key columns:
-  - `InventoryItem_ID` (Shopify GID format)
-  - `Available` (forward sync writes here)
-  - Reverse sync extension:
-    - `Desired_Available`
-    - `ReverseSync_Status`
-    - `ReverseSync_LastPushedAt`
-    - `ReverseSync_LastError`
+> Desired_Available is **cleared automatically** after a successful sync.
 
-## Secrets / configuration
+---
 
-### Shopify Admin Token
-Stored in Secret Manager:
-- Secret: `shopify-admin-token`
-Injected into the reverse job as env var:
-- `SHOPIFY_ADMIN_TOKEN`
+## Cloud Run Jobs
 
-### Reverse job env vars
-- `SPREADSHEET_ID`
-- `SHEET_NAME` (`Truth_Table`)
-- `MAX_ROWS_PER_RUN` (e.g. 10)
-- `SHOPIFY_STORE_DOMAIN` (`holy-tea-amsterdam.myshopify.com`)
-- `SHOPIFY_LOCATION_ID` (`gid://shopify/Location/66678325498`)
+### inventory-sync-job
+- Direction: Shopify → Sheets
+- Trigger: Cloud Scheduler
+- Input: Pub/Sub webhook events
+- Output: Updates `Available`
 
-## Local development notes
-- Prefer Cloud Build + Cloud Run Jobs for runtime parity.
-- Do **not** commit credentials (service account keys / tokens).
-- Use Secret Manager for sensitive values.
+### inventory-reverse-sync-job
+- Direction: Sheets → Shopify
+- Trigger: Cloud Scheduler
+- Logic:
+  - Finds rows where Desired_Available ≠ Available
+  - Uses CAS (`compareQuantity`) for safety
+  - Retries using live Shopify inventory if stale
+  - Clears Desired_Available after success
 
-## Deployment (Cloud Build)
-Example:
+### inventory-reconcile-available-job
+- Purpose: Recovery / consistency
+- Rebuilds `Available` from Shopify for all rows
+- Use when stale quantity errors appear
+
+---
+
+## Shopify API Usage
+
+- API: Admin GraphQL (2025-10)
+- Mutation: inventorySetQuantities
+- Safety: compareQuantity (optimistic locking)
+- Retry source:
+  ```
+  location(id) → inventoryLevels → item.id → available
+  ```
+
+---
+
+## Secrets & Security
+
+- Shopify Admin token stored in Google Secret Manager
+  - Secret: `shopify-admin-token`
+- Injected via Cloud Run Job config
+- No secrets stored in code or repository
+
+---
+
+## Deployment
+
+Build image:
 ```bash
-gcloud builds submit --tag gcr.io/shopify-inventory-sync-482323/inventory-sync-worker:reverse-sync .
+gcloud builds submit \
+  --tag gcr.io/shopify-inventory-sync-482323/inventory-sync-worker:reverse-sync .
+```
+
+Update job:
+```bash
+gcloud run jobs update inventory-reverse-sync-job \
+  --region=europe-west4 \
+  --image=gcr.io/shopify-inventory-sync-482323/inventory-sync-worker:reverse-sync
+```
+
+---
+
+## Operational Notes
+
+- Google Sheets is not real-time
+- System is eventually consistent by design
+- Forward sync always wins after reverse sync
+- All writes are idempotent and retry-safe
+
+---
+
+## Status
+
+✅ Production ready
+✅ Reverse sync enabled
+✅ Scheduler-driven
+✅ Safe against infinite loops
+
+Maintained by **Holy Tea Amsterdam**.
+
