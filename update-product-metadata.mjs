@@ -16,6 +16,10 @@ const CONFIG = {
   },
 
   maxRowsPerRun: Number(process.env.MAX_ROWS_PER_RUN || "500"),
+  excludeProductTypeKeywords: (process.env.EXCLUDE_PRODUCTTYPE_KEYWORDS || "bundle,subscription,box")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
 
   shopDomain: process.env.SHOPIFY_STORE_DOMAIN,
 };
@@ -114,6 +118,12 @@ function shouldUpdateValue(currentValue, nextValue) {
   return String(currentValue ?? "") !== String(nextValue);
 }
 
+function isExcludedProductType(productType, keywords) {
+  if (!productType) return false;
+  const normalized = String(productType).toLowerCase();
+  return keywords.some((keyword) => normalized.includes(keyword));
+}
+
 async function main() {
   requireEnv("SPREADSHEET_ID");
   requireEnv("SHOPIFY_STORE_DOMAIN");
@@ -178,6 +188,9 @@ async function main() {
     if (updatedRows >= CONFIG.maxRowsPerRun) break;
     const details = detailsMap.get(row.inventoryItemId);
     if (!details) continue;
+    if (isExcludedProductType(details.productType, CONFIG.excludeProductTypeKeywords)) {
+      continue;
+    }
 
     const changes = [
       {

@@ -21,6 +21,10 @@ const CONFIG = {
   },
 
   maxRowsPerRun: Number(process.env.MAX_ROWS_PER_RUN || "200"),
+  excludeProductTypeKeywords: (process.env.EXCLUDE_PRODUCTTYPE_KEYWORDS || "bundle,subscription,box")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
 
   shopDomain: process.env.SHOPIFY_STORE_DOMAIN,
   locationId: process.env.SHOPIFY_LOCATION_ID, // gid://shopify/Location/...
@@ -148,6 +152,12 @@ function buildRowFromHeaders(headers, valuesByHeader) {
   return headers.map((header) => (header in valuesByHeader ? valuesByHeader[header] : ""));
 }
 
+function isExcludedProductType(productType, keywords) {
+  if (!productType) return false;
+  const normalized = String(productType).toLowerCase();
+  return keywords.some((keyword) => normalized.includes(keyword));
+}
+
 async function main() {
   requireEnv("SPREADSHEET_ID");
   requireEnv("SHOPIFY_STORE_DOMAIN");
@@ -207,6 +217,9 @@ async function main() {
   for (const inventoryItemId of missingIds) {
     const available = availableMap.get(inventoryItemId);
     const details = detailsMap.get(inventoryItemId) || {};
+    if (isExcludedProductType(details.productType, CONFIG.excludeProductTypeKeywords)) {
+      continue;
+    }
     newRows.push(
       buildRowFromHeaders(headers, {
         [CONFIG.headers.inventoryItemId]: inventoryItemId,
