@@ -47,10 +47,24 @@ Respect existing architecture and constraints.
 - Rebuilds `Available` from Shopify
 - Used to eliminate stale quantity mismatches
 
+### Append New Items Job
+- Scheduled or manual Cloud Run Job
+- Appends missing Shopify inventory items into `Truth_Table`
+- Populates `Available` and metadata columns when headers exist
+
+### Product Metadata Update Job
+- Scheduled or manual Cloud Run Job
+- Updates Category/Product_Title/Variant_Title/SKU for existing rows
+- Only overwrites when Shopify value is non-empty and different
+
 ---
 
 ## Google Sheets Schema (Truth_Table)
 
+- Category → Shopify productType (metadata)
+- Product_Title → Shopify product title (metadata)
+- Variant_Title → Shopify variant title (metadata)
+- SKU → Shopify SKU (metadata)
 - Desired_Available → human input
 - Available → last known Shopify quantity
 - ReverseSync_Status → operational state
@@ -69,6 +83,7 @@ Respect existing architecture and constraints.
   - `location(id) { inventoryLevels { item { id } quantities } }`
 - Always support pagination
 - Avoid undocumented GraphQL fields
+- Metadata exclusions must be configurable via `EXCLUDE_PRODUCTTYPE_KEYWORDS`
 
 ---
 
