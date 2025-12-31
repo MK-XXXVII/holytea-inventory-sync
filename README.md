@@ -55,6 +55,10 @@ Cloud Run Job (inventory-reconcile-available-job)
 
 | Column | Name | Purpose |
 |------:|------|---------|
+| A | Category | Shopify productType (metadata sync) |
+| B | Product_Title | Shopify product title (metadata sync) |
+| C | Variant_Title | Shopify variant title (metadata sync) |
+| D | SKU | Shopify SKU (metadata sync) |
 | E | Desired_Available | User input – desired stock to push to Shopify |
 | F | Available | Last known Shopify quantity |
 | G | ReverseSync_Status | PENDING, ERROR, or empty |
@@ -88,6 +92,21 @@ Cloud Run Job (inventory-reconcile-available-job)
 - Rebuilds `Available` from Shopify for all rows
 - Use when stale quantity errors appear
 
+### inventory-append-new-items-job
+- Purpose: Append new Shopify inventory items into `Truth_Table`
+- Trigger: Cloud Scheduler or manual
+- Output:
+  - Appends rows that are missing `InventoryItem_ID`
+  - Populates `Available` and metadata columns when headers exist
+
+### inventory-update-product-metadata-job
+- Purpose: Maintain metadata columns (Category/Product_Title/Variant_Title/SKU)
+- Trigger: Cloud Scheduler or manual
+- Output:
+  - Updates metadata when Shopify values are non-empty and different
+  - Fills empty metadata cells
+  - Does not alter inventory quantities
+
 ---
 
 ## Shopify API Usage
@@ -111,6 +130,16 @@ Cloud Run Job (inventory-reconcile-available-job)
 
 ---
 
+## Metadata Sync (Category/Product_Title/Variant_Title/SKU)
+
+- Source fields come from Shopify `InventoryItem → Variant → Product`
+- `Category` maps to Shopify `productType`
+- Jobs support excluding certain product types via:
+  - `EXCLUDE_PRODUCTTYPE_KEYWORDS` (comma-separated, default: `bundle,subscription,box`)
+  - Example: `EXCLUDE_PRODUCTTYPE_KEYWORDS=bundle,subscription,box,kit`
+
+---
+
 ## Deployment
 
 Build image:
@@ -124,6 +153,24 @@ Update job:
 gcloud run jobs update inventory-reverse-sync-job \
   --region=europe-west4 \
   --image=gcr.io/shopify-inventory-sync-482323/inventory-sync-worker:reverse-sync
+```
+
+Update append job:
+```bash
+gcloud run jobs update inventory-append-new-items-job \
+  --region=europe-west4 \
+  --image=gcr.io/shopify-inventory-sync-482323/inventory-sync-worker:append-new-items \
+  --command=node \
+  --args=append-new-items.mjs
+```
+
+Update metadata job:
+```bash
+gcloud run jobs update inventory-update-product-metadata-job \
+  --region=europe-west4 \
+  --image=gcr.io/shopify-inventory-sync-482323/inventory-sync-worker:update-product-metadata \
+  --command=node \
+  --args=update-product-metadata.mjs
 ```
 
 ---
@@ -145,4 +192,3 @@ gcloud run jobs update inventory-reverse-sync-job \
 ✅ Safe against infinite loops
 
 Maintained by **Holy Tea Amsterdam**.
-
